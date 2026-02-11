@@ -79,9 +79,16 @@ impl Observer {
         request: &mut CoapRequest<SocketAddr>,
         responder: Arc<dyn Responder>,
     ) -> bool {
-        if request.message.header.get_type() == MessageType::Acknowledgement {
-            self.acknowledge(request);
-            return false;
+        match request.message.header.get_type() {
+            MessageType::Acknowledgement => {
+                self.acknowledge(request);
+                return false;
+            }
+            MessageType::Reset => {
+                self.reset_notification(request);
+                return false;
+            }
+            _ => {}
         }
 
         match (request.get_method(), request.get_observe_flag()) {
@@ -179,6 +186,53 @@ impl Observer {
             &resource_path,
             &request.message.get_token(),
         );
+    }
+
+    /// handle reset message from client.
+    /// according to rfc 7641 section 4.5, if a client rejects a notification with a reset message,
+    /// the server must remove the associated entry from the list of observers.
+    fn reset_notification(&mut self, request: &CoapRequest<SocketAddr>) {
+        let message_id = request.message.header.message_id;
+
+        // the reset message does not contain a token, so we must use the message id
+        // to find the corresponding observer.
+        if let Some(unack_item) = self.unacknowledge_messages.remove(&message_id) {
+            let register_resource_key = &unack_item.register_resource;
+
+            // Clear the unacknowledged message ID here to prevent `remove_register_resource`
+            // from attempting to remove it again.
+            if let Some(item) = self.register_resources.get_mut(register_resource_key) {
+                item.unacknowledge_message = None;
+            }
+
+            // retrieve the details needed to remove the registration.
+            let (address, resource_path, token) = {
+                if let Some(item) = self.register_resources.get(register_resource_key) {
+                    (
+                        item.registered_responder.address(),
+                        item.resource.clone(),
+                        item.token.clone(),
+                    )
+                } else {
+                    // this case should ideally not happen if data structures are consistent.
+                    warn!(
+                        "Reset received for unknown registration key: {}",
+                        register_resource_key
+                    );
+                    return;
+                }
+            };
+
+            debug!(
+                "Reset received from {} for resource {}, removing observer",
+                address, resource_path
+            );
+
+            self.remove_register_resource(&address, &resource_path, &token);
+        } else {
+            // reset for an unknown message id, possibly a duplicate or late arrival.
+            debug!("Reset received for unknown Message ID: {}", message_id);
+        }
     }
 
     async fn resource_changed(&mut self, request: &CoapRequest<SocketAddr>) {
@@ -572,5 +626,108 @@ mod test {
             .unwrap();
         let error = client.observe(path, |_msg| {}).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_observe_cancelled_by_rst() {
+        use async_trait::async_trait;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+        let mut observer = Observer::new();
+        let path = "test";
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+
+        // Mock Responder to intercept outgoing packets (notifications)
+        struct MockResponder {
+            addr: SocketAddr,
+            tx: UnboundedSender<Vec<u8>>,
+        }
+
+        #[async_trait]
+        impl Responder for MockResponder {
+            async fn respond(&self, bytes: Vec<u8>) {
+                self.tx.send(bytes).unwrap();
+            }
+            fn address(&self) -> SocketAddr {
+                self.addr
+            }
+        }
+
+        // Setup: Create a resource and a channel to capture notifications
+        observer.resources.insert(
+            path.to_string(),
+            ResourceItem {
+                payload: vec![],
+                register_resources: HashSet::new(),
+                sequence: 0,
+            },
+        );
+
+        let (tx, mut rx) = unbounded_channel();
+        let responder = Arc::new(MockResponder { addr, tx });
+
+        // Register the observer
+        let mut register_req = CoapRequest::<SocketAddr>::new();
+        register_req.set_path(path);
+        register_req.set_method(Method::Get);
+        register_req.message.set_token(vec![1, 2, 3, 4]);
+        register_req.set_observe_flag(ObserveOption::Register);
+        register_req.source = Some(addr);
+
+        observer
+            .request_handler(&mut register_req, responder.clone())
+            .await;
+
+        let key = format!("{}${}", addr, path);
+        assert!(observer.register_resources.contains_key(&key));
+
+        // Trigger a resource change (PUT) to cause a notification
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_path(path);
+        put_req.set_method(Method::Put);
+        put_req.message.payload = b"data1".to_vec();
+        put_req.source = Some(addr);
+
+        observer
+            .request_handler(&mut put_req, responder.clone())
+            .await;
+
+        // Intercept the notification to get its Message ID
+        let notification_bytes = rx.recv().await.unwrap();
+        let notification_pkt = Packet::from_bytes(&notification_bytes).unwrap();
+        assert_eq!(notification_pkt.header.get_type(), MessageType::Confirmable);
+        let mid = notification_pkt.header.message_id;
+
+        // Simulate the client rejecting the notification with a Reset message
+        let mut rst_req = CoapRequest::<SocketAddr>::new();
+        rst_req.message.header.set_type(MessageType::Reset);
+        rst_req.message.header.set_code("0.00");
+        rst_req.message.header.message_id = mid;
+        rst_req.source = Some(addr);
+
+        observer
+            .request_handler(&mut rst_req, responder.clone())
+            .await;
+
+        // Verify that the observer has been removed from the list
+        assert!(!observer.register_resources.contains_key(&key));
+
+        // Trigger another resource change and ensure no new notification is sent
+        let mut put_req2 = CoapRequest::<SocketAddr>::new();
+        put_req2.set_path(path);
+        put_req2.set_method(Method::Put);
+        put_req2.message.payload = b"data2".to_vec();
+        put_req2.source = Some(addr);
+
+        observer
+            .request_handler(&mut put_req2, responder.clone())
+            .await;
+
+        // Use timeout to verify the channel is empty (no notification sent)
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Expected no notification after RST cancellation"
+        );
     }
 }
